@@ -1,1 +1,0 @@
-# AI-Club-Hackathon-Student-Health-Project
