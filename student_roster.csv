@@ -1,0 +1,4 @@
+first_name,last_name,student_id,has_extra,hipaa_consent,class_one,class_2,class_3,class_4,class_5,class_6,class_7,class_8,extra_swipe,extra_credit_class_1,extra_credit_class_2,extra_credit_class_3,extra_credit_class_4,extra_credit_class_5,extra_credit_class_6,extra_credit_class_7,extra_credit_class_8,extra_credit_extra_swipe
+Wiilliam,Pitts,1,True,True,Parallel and Distributed Computing,Artificial Intelligence,Algorithm Analysis,Data Mining,,,,Add one extra dining swipe,,,,1,,,,,,0
+Bob,Joe,2,True,True,1,2,3,4,5,6,7,8,Add one extra dining swipe,,1,,,,,,,0
+Bobby,Joey,3,True,True,1,2,3,4,5,6,7,8,Add one extra dining swipe,,,,,,,,,1

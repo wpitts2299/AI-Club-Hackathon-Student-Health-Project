@@ -1,0 +1,8 @@
+Therapist login options:
+- Default CSV path: data/therapists.csv (override with HACKATHON_THERAPIST_CSV).
+- Accepts either:
+  - Username/password from CSV (creates a cookie session), or
+  - X-Therapist-Key header/query param matching HACKATHON_THERAPIST_KEY or HACKATHON_API_KEY.
+- Login form at /therapist requires one of the above. If the CSV is missing, add records in the format:
+    therapist_name,therapist_id,username,password
+    Demo Therapist,0001,therapist,changeme

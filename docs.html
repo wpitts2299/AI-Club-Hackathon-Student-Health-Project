@@ -1,0 +1,63 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <link type="text/css" rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+    <link rel="shortcut icon" href="https://fastapi.tiangolo.com/img/favicon.png">
+    <title>Hackathon Student Support API - Docs</title>
+    </head>
+    <body>
+    <div id="swagger-ui">
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <!-- `SwaggerUIBundle` is now available on the page -->
+    <script>
+    const ui = SwaggerUIBundle({
+        url: '/openapi.json',
+    "dom_id": "#swagger-ui",
+"layout": "BaseLayout",
+"deepLinking": true,
+"showExtensions": true,
+"showCommonExtensions": true,
+"defaultModelsExpandDepth": -1,
+
+    presets: [
+        SwaggerUIBundle.presets.apis,
+        SwaggerUIBundle.SwaggerUIStandalonePreset
+        ],
+    })
+    </script>
+    
+<style>
+.swagger-ui .opblock .opblock-body {display:none;}
+.swagger-ui .opblock .opblock-body.show-body {display:block;}
+</style>
+<script>
+(function(){
+    function toggleBody(button, show) {
+        if (!button) return;
+        var opblock = button.closest('.opblock');
+        if (!opblock) return;
+        var body = opblock.querySelector('.opblock-body');
+        if (!body) return;
+        if (show) {
+            body.classList.add('show-body');
+        } else {
+            body.classList.remove('show-body');
+        }
+    }
+    document.addEventListener('click', function(event) {
+        var button = event.target.closest('.try-out__btn');
+        if (!button) return;
+        var cancelling = button.classList.contains('cancel');
+        if (cancelling) {
+            toggleBody(button, false);
+        } else {
+            setTimeout(function() { toggleBody(button, true); }, 0);
+        }
+    });
+})();
+</script>
+</body>
+    </html>
+    
