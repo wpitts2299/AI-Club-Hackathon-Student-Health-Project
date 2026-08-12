@@ -1,6 +1,6 @@
 # Hackathon Student Support API
 
-FastAPI service and CLI for analyzing student-written text for academic stress, mental-health risk, and dominant emotions. The project ships with fine-tuned transformer models, a secure student submission flow (with roster validation and HIPAA consent), a therapist review dashboard, and encrypted high-risk alert handling. No real credentials, API keys, private student information, encryption keys or sensitive data are committed anywhere in this project.
+FastAPI service and CLI for analyzing student-written text for academic stress, mental-health risk, and dominant emotions. The project ships with fine-tuned transformer models, a secure student submission flow (with roster validation and HIPAA consent), a therapist review dashboard, and encrypted high-risk alert handling. No real credentials, API keys, private student information, encryption keys or sensitive data are committed anywhere in this project. Project is not HIPAA Certified.
 
 ## What’s here
 
