@@ -4,9 +4,10 @@ import csv
 import os
 import secrets
 import tempfile
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterable
 
 # Disable Hugging Face telemetry so test inputs never leave the server.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -31,6 +32,7 @@ from transformers import (
 import torch
 import torch.nn.functional as F
 from transformers.utils import logging
+from captum.attr import IntegratedGradients
 
 try:
     from cryptography.fernet import Fernet
@@ -244,12 +246,6 @@ CUSTOM_DOCS_HTML = """
             <p id="validationStatus" class="validation status-muted">Enter your student ID to continue.</p>
             <label for="studentText">Student text</label>
             <textarea id="studentText" placeholder="I failed three classes and feel hopeless. I need help." disabled></textarea>
-            <div style="margin:8px 0;">
-                <label style="display:flex; align-items:center; gap:8px;">
-                    <input id="consentCheckbox" type="checkbox" />
-                    <span>I consent to the HIPAA notice.</span>
-                </label>
-            </div>
             <p id="wordCounter" class="validation status-muted" style="margin-top:6px;">0/__MIN_WORDS__ words (min).</p>
             <div id="extraCreditSection" style="display:none; margin-top:12px; background:#eef2ff; border-radius:12px; padding:12px;">
                 <label for="extraCreditSelect">Choose a class to receive +1 extra credit</label>
@@ -311,7 +307,6 @@ CUSTOM_DOCS_HTML = """
         const extraCreditSelect = document.getElementById('extraCreditSelect');
         const extraCreditStatus = document.getElementById('extraCreditStatus');
         const extraCreditSummary = document.getElementById('extraCreditSummary');
-        const consentCheckbox = document.getElementById('consentCheckbox');
         const wordCounter = document.getElementById('wordCounter');
         const MIN_WORDS = parseInt(document.body.dataset.minWords || "50", 10) || 50;
         let validatedStudent = null;
@@ -369,7 +364,7 @@ CUSTOM_DOCS_HTML = """
         function updateExecuteState() {
             const count = updateWordCounter();
             const hasText = studentText.value.trim().length > 0;
-            const unlocked = !!validatedStudent && count >= MIN_WORDS && hasText && consentCheckbox.checked;
+            const unlocked = !!validatedStudent && count >= MIN_WORDS && hasText;
             executeButton.disabled = !unlocked;
         }
 
@@ -554,10 +549,6 @@ CUSTOM_DOCS_HTML = """
         studentText.addEventListener('input', () => {
             updateExecuteState();
         });
-        consentCheckbox.addEventListener('change', () => {
-            updateExecuteState();
-        });
-
         tryButton.addEventListener('click', () => togglePanel(true));
         cancelButton.addEventListener('click', () => togglePanel(false));
 
@@ -586,7 +577,7 @@ CUSTOM_DOCS_HTML = """
                 const response = await fetch('/analyze', {
                     method: 'POST',
                     headers,
-                    body: JSON.stringify({ text, student_id: validatedStudent.student_id, consent: true })
+                    body: JSON.stringify({ text, student_id: validatedStudent.student_id })
                 });
             const payload = await response.json();
             if (!response.ok) {
@@ -665,6 +656,25 @@ MENTAL_SUICIDAL_SEMANTIC_PATTERNS = [
     "don't trust myself near bridges",
 ]
 
+POSITIVE_EMOTIONS = {
+    "joy",
+    "love",
+    "optimism",
+    "surprise",
+    "gratitude",
+    "amusement",
+    "pride",
+}
+
+NEGATIVE_EMOTIONS = {
+    "anger",
+    "sadness",
+    "fear",
+    "disgust",
+    "anxiety",
+    "pessimism",
+}
+
 ACADEMIC_STRESS_SCALE = {
     "0": "None",
     "1": "Very low",
@@ -687,7 +697,7 @@ STUDENT_ROSTER_PATH = Path(
     os.getenv("HACKATHON_STUDENT_ROSTER", str(Path("data") / "student_roster.csv"))
 )
 REQUIRED_ROSTER_COLUMNS = ("first_name", "last_name", "student_id")
-ROSTER_STATUS_COLUMNS = ["has_extra", "hipaa_consent"]
+ROSTER_STATUS_COLUMNS = ["has_extra"]
 ROSTER_CLASS_COLUMNS = [
     "class_one",
     "class_2",
@@ -717,6 +727,17 @@ def record_analysis(
     source: str, text: str, result: Dict[str, Any], student_id: Optional[str] = None
 ) -> None:
     """Persist a short in-memory history so therapists can review results."""
+    pos_top = _top_emotion(result.get("emotions") or {}, POSITIVE_EMOTIONS)
+    neg_top = _top_emotion(result.get("emotions") or {}, NEGATIVE_EMOTIONS)
+    if pos_top or neg_top:
+        logger.info(
+            "Emotion summary [%s]: positive=%s (%.1f%%), negative=%s (%.1f%%)",
+            source,
+            (pos_top or {}).get("label", "N/A"),
+            (pos_top or {}).get("score", 0.0),
+            (neg_top or {}).get("label", "N/A"),
+            (neg_top or {}).get("score", 0.0),
+        )
     entry = {
         "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
@@ -728,6 +749,9 @@ def record_analysis(
         "mental_health_flags": result.get("mental_health_flags") or {},
         "alert_metadata": result.get("alert_metadata") or {},
         "high_risk": bool(result.get("alert_metadata")),
+        "top_positive_emotion": pos_top or {},
+        "top_negative_emotion": neg_top or {},
+        "explanations": result.get("explanations") or {},
     }
     RECENT_ANALYSES.append(entry)
     if len(RECENT_ANALYSES) > MAX_ANALYSIS_HISTORY:
@@ -1045,6 +1069,29 @@ def _read_bool_env(var_name: str) -> Optional[bool]:
     return None
 
 
+# Down-weight scores when text refers to third parties or quoted speech
+THIRD_PERSON_PATTERN = re.compile(
+    r"\b(he|she|they|them|their|theirs|him|her|hers)\b", re.IGNORECASE
+)
+
+def _third_person_weight(text: str) -> float:
+    """Return a multiplier in [0.5, 1.0] when many sentences look third-person or quoted."""
+    sentences = re.split(r"[.!?]+", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return 1.0
+    third_person_hits = sum(1 for s in sentences if THIRD_PERSON_PATTERN.search(s))
+    ratio = third_person_hits / len(sentences)
+    weight = 1.0
+    if ratio >= 0.5:
+        weight = 0.6
+    elif ratio >= 0.25:
+        weight = 0.8
+    if '"' in text or "'" in text:
+        weight *= 0.9
+    return max(0.5, min(1.0, weight))
+
+
 def _order_roster_columns(df: pd.DataFrame) -> pd.DataFrame:
     preferred = (
         list(REQUIRED_ROSTER_COLUMNS)
@@ -1104,7 +1151,6 @@ def _load_roster_dataframe() -> pd.DataFrame:
     df = _order_roster_columns(df)
     # Normalize has_extra as boolean-like strings for consistency
     df["has_extra"] = df["has_extra"].apply(_parse_bool_flag)
-    df["hipaa_consent"] = df["hipaa_consent"].apply(_parse_bool_flag)
     return df
 
 
@@ -1153,7 +1199,6 @@ def _get_student_row(df: pd.DataFrame, student_id: str) -> pd.Series:
     row = df.loc[idx].copy()
     row["_roster_index"] = idx
     row["has_extra"] = _parse_bool_flag(row.get("has_extra"))
-    row["hipaa_consent"] = _parse_bool_flag(row.get("hipaa_consent"))
     return row
 
 
@@ -1169,7 +1214,6 @@ def _load_student_roster(include_classes: bool = False) -> Dict[str, Dict[str, A
             "first_name": str(row["first_name"]).strip(),
             "last_name": str(row["last_name"]).strip(),
             "has_extra": _parse_bool_flag(row.get("has_extra")),
-            "has_consent": _parse_bool_flag(row.get("hipaa_consent")),
         }
         if include_classes:
             entry["classes"] = _extract_class_entries(row)
@@ -1248,15 +1292,6 @@ def _increment_extra_credit(student_id: str, class_key: str, points: int = 1) ->
     }
 
 
-def _set_student_consent(student_id: str, consent: bool = True) -> None:
-    df = _load_roster_dataframe()
-    row = _get_student_row(df, student_id)
-    roster_idx = int(row["_roster_index"])
-    df.at[roster_idx, "hipaa_consent"] = bool(consent)
-    df = _order_roster_columns(df)
-    df.to_csv(STUDENT_ROSTER_PATH, index=False)
-
-
 ALERT_OUTPUT_DIR = Path(
     os.getenv("HACKATHON_ALERT_DIR", str(Path.cwd() / "alerts"))
 )
@@ -1296,6 +1331,123 @@ def _assign_score_case_insensitive(scores: Dict[str, float], label: str, value: 
     target_label = next((key for key in scores.keys() if key.lower() == label.lower()), label)
     scores[target_label] = value
     return target_label
+
+def _integrated_gradients_tokens(
+    model,
+    tokenizer,
+    text: str,
+    target_idx: int,
+    steps: int = 32,
+) -> Tuple[List[str], List[float]]:
+    """Compute token-level Integrated Gradients for a target class."""
+    enc = tokenizer(text, return_tensors="pt", truncation=True)
+    input_ids = enc["input_ids"]
+    attention_mask = enc.get("attention_mask")
+
+    def forward_func(ids, mask):
+        outputs = model(input_ids=ids, attention_mask=mask)
+        return outputs.logits
+
+    ig = IntegratedGradients(lambda ids, mask: forward_func(ids, mask))
+    attributions, _ = ig.attribute(
+        inputs=input_ids,
+        baselines=torch.zeros_like(input_ids),
+        additional_forward_args=(attention_mask,),
+        target=target_idx,
+        n_steps=steps,
+        return_convergence_delta=False,
+    )
+    # sum across embedding dim
+    token_attrs = attributions.sum(dim=-1)[0]
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+    return tokens, token_attrs.tolist()
+
+def _tokens_to_spans(tokenizer, tokens: List[str], scores: List[float], top_k: int = 6) -> List[str]:
+    """Return merged high-attribution spans from tokens + scores."""
+    special = {"[CLS]", "[SEP]", "[PAD]", "<s>", "</s>", "<pad>"}
+    cleaned = []
+    for idx, (tok, sc) in enumerate(zip(tokens, scores)):
+        if tok in special:
+            continue
+        cleaned.append((idx, tok, sc))
+    if not cleaned:
+        return []
+    # pick top_k by absolute score
+    cleaned = sorted(cleaned, key=lambda x: abs(x[2]), reverse=True)[:top_k]
+    cleaned = sorted(cleaned, key=lambda x: x[0])
+
+    spans = []
+    current = []
+    last_idx = None
+    for idx, tok, sc in cleaned:
+        if last_idx is not None and idx == last_idx + 1:
+            current.append((idx, tok))
+        else:
+            if current:
+                spans.append(current)
+            current = [(idx, tok)]
+        last_idx = idx
+    if current:
+        spans.append(current)
+
+    results = []
+    for span in spans:
+        span_tokens = [t for _, t in span]
+        results.append(tokenizer.convert_tokens_to_string(span_tokens).strip())
+    # dedupe and keep non-empty
+    uniq = []
+    for s in results:
+        if s and s not in uniq:
+            uniq.append(s)
+    return uniq
+
+def _build_rationales(
+    text: str,
+    model,
+    tokenizer,
+    label_scores: Dict[str, float],
+    labels: List[str],
+    max_labels: int = 2,
+    top_k_tokens: int = 6,
+) -> List[Dict[str, Any]]:
+    """Return rationale spans for top labels."""
+    ranked = sorted(
+        [(lbl, label_scores.get(lbl, 0.0), idx) for idx, lbl in enumerate(labels)],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    rationales: List[Dict[str, Any]] = []
+    for lbl, score, idx in ranked[:max_labels]:
+        try:
+            toks, attrs = _integrated_gradients_tokens(model, tokenizer, text, idx)
+            spans = _tokens_to_spans(tokenizer, toks, attrs, top_k=top_k_tokens)
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("IG rationale failed for %s: %s", lbl, exc)
+            spans = []
+        rationales.append(
+            {
+                "label": lbl,
+                "score": float(score),
+                "spans": spans,
+            }
+        )
+    return rationales
+
+def _top_emotion(
+    emotion_scores: Dict[str, float], candidates: Sequence[str]
+) -> Optional[Dict[str, Any]]:
+    """Return the top-scoring emotion from a candidate set (case-insensitive)."""
+    best_label = None
+    best_score: Optional[float] = None
+    candidate_set = {c.lower() for c in candidates}
+    for label, score in emotion_scores.items():
+        if label.lower() in candidate_set:
+            if best_score is None or score > best_score:
+                best_label = label
+                best_score = float(score)
+    if best_label is None:
+        return None
+    return {"label": best_label, "score": best_score}
 
 def _segment_text(text: str) -> List[str]:
     """Split text into rough sentence/phrase segments for local risk scanning."""
@@ -1760,7 +1912,26 @@ def analyze_student_text(text: str):
     emotion_labels = _labels_from_model(emotion_model, len(em_percent))
     emotion_scores = {emotion_labels[i]: em_percent[i] for i in range(len(em_percent))}
 
-    # === Suicidal risk boost (rule-conditional) ===
+    # === Explanations via Integrated Gradients (top labels per section) ===
+    explanations = {
+        "stress": _build_rationales(
+            text, stress_model, stress_tokenizer, stress_scores, stress_labels, max_labels=1
+        ),
+        "mental_health": _build_rationales(
+            text, mental_model, mental_tokenizer, mental_scores, mental_labels, max_labels=2
+        ),
+        "emotions": _build_rationales(
+            text, emotion_model, emotion_tokenizer, emotion_scores, emotion_labels, max_labels=2
+        ),
+    }
+
+    # Apply third-person/quote down-weighting before alert logic
+    third_person_weight = _third_person_weight(text)
+    if third_person_weight < 1.0:
+        mental_scores = {k: v * third_person_weight for k, v in mental_scores.items()}
+        emotion_scores = {k: v * third_person_weight for k, v in emotion_scores.items()}
+
+# === Suicidal risk boost (rule-conditional) ===
     text_lower = text.lower()
     suicidal_score, suicidal_reasons, mentions_suicide, suicidal_raw, patterns_hit = (
         _boost_suicidal_score(mental_scores, emotion_scores, text_lower)
@@ -1802,6 +1973,7 @@ def analyze_student_text(text: str):
         "academic_stress": stress_scores,
         "mental_health": mental_scores,
         "emotions": emotion_scores,
+        "explanations": explanations,
     }
     if MENTAL_IS_MULTI_LABEL:
         response["mental_health_flags"] = mental_flags
@@ -1863,12 +2035,6 @@ class AnalyzeRequest(BaseModel):
         ),
         example="I failed three classes and feel hopeless. I need help.",
     )
-    consent: bool = Field(
-        ...,
-        description="HIPAA consent acknowledgment required to submit.",
-        example=True,
-    )
-
 class AnalyzeResponse(BaseModel):
     academic_stress: Dict[str, float]
     mental_health: Dict[str, float]
@@ -1911,7 +2077,6 @@ class StudentValidationResponse(BaseModel):
     last_name: Optional[str] = None
     classes: List[StudentClassInfo] = Field(default_factory=list)
     has_extra: bool = False
-    has_consent: bool = False
     message: str
 
 
@@ -1978,7 +2143,6 @@ def validate_student_endpoint(
         "last_name": student.get("last_name") or None,
         "classes": student.get("classes") or [],
         "has_extra": bool(student.get("has_extra")),
-        "has_consent": bool(student.get("has_consent")),
         "message": "Student ID verified.",
     }
 
@@ -2021,6 +2185,49 @@ def therapist_dashboard(
                     _score_block_html("Emotions", entry["emotions"]),
                 ]
             )
+            pos_top = entry.get("top_positive_emotion") or {}
+            neg_top = entry.get("top_negative_emotion") or {}
+            pos_label = html.escape(str(pos_top.get("label", "N/A")))
+            neg_label = html.escape(str(neg_top.get("label", "N/A")))
+            pos_score = pos_top.get("score")
+            neg_score = neg_top.get("score")
+            pos_text = (
+                f"{pos_label} ({pos_score:.2f}%)" if isinstance(pos_score, (int, float)) else pos_label
+            )
+            neg_text = (
+                f"{neg_label} ({neg_score:.2f}%)" if isinstance(neg_score, (int, float)) else neg_label
+            )
+            summary_block = (
+                "<div class='score-block'>"
+                "<h4>Emotion Summary</h4>"
+                f"<p><strong>Positive:</strong> {pos_text}</p>"
+                f"<p><strong>Negative:</strong> {neg_text}</p>"
+                "</div>"
+            )
+            score_blocks += summary_block
+            # Rationale spans
+            explanations = entry.get("explanations") or {}
+            rationale_sections = []
+            for section_title, items in [
+                ("Stress Rationales", explanations.get("stress") or []),
+                ("Mental Health Rationales", explanations.get("mental_health") or []),
+                ("Emotion Rationales", explanations.get("emotions") or []),
+            ]:
+                if not items:
+                    continue
+                bullets = []
+                for item in items:
+                    label = html.escape(str(item.get("label", "N/A")))
+                    spans = item.get("spans") or []
+                    span_text = "; ".join(html.escape(s) for s in spans) if spans else "No span captured"
+                    bullets.append(f"<li><strong>{label}</strong>: {span_text}</li>")
+                rationale_sections.append(
+                    "<div class='score-block'>"
+                    f"<h4>{section_title}</h4>"
+                    f"<ul>{''.join(bullets)}</ul>"
+                    "</div>"
+                )
+            score_blocks += "".join(rationale_sections)
             flags = entry.get("mental_health_flags") or {}
             flag_items = (
                 "<li>No high-risk indicators detected.</li>"
@@ -2350,19 +2557,12 @@ def analyze_endpoint(payload: AnalyzeRequest, _: Optional[str] = Depends(require
     cleaned = payload.text.strip()
     if not cleaned:
         raise HTTPException(status_code=400, detail="Text must not be empty.")
-    if not payload.consent:
-        raise HTTPException(status_code=400, detail="HIPAA consent must be acknowledged before submission.")
     word_count = _word_count(cleaned)
     if word_count < MIN_RESPONSE_WORDS:
         raise HTTPException(
             status_code=400,
             detail=f"Text must be at least {MIN_RESPONSE_WORDS} words (received {word_count}).",
         )
-    try:
-        _set_student_consent(payload.student_id, True)
-    except HTTPException:
-        # If roster write fails for some reason, still proceed with analysis
-        pass
     result = analyze_student_text(cleaned)
     record_analysis("api", cleaned, result, student_id=payload.student_id)
     return result
@@ -2420,12 +2620,6 @@ def show_submission_form():
                 <p class="status" id="submitStatus">Validate your student ID to unlock the response box.</p>
                 <label for="text">Paste or type the message:</label>
                 <textarea id="text" name="text" placeholder="I feel overwhelmed by exams and can't sleep..." disabled></textarea>
-                <p class="status muted" style="margin:6px 0 2px;">
-                    <label style="display:flex; align-items:center; gap:8px;">
-                        <input id="submitConsent" type="checkbox" />
-                        <span>I consent to the HIPAA notice.</span>
-                    </label>
-                </p>
                 <p id="submitWordCounter" class="status muted">0/__MIN_WORDS__ words (min).</p>
                 <label for="apiKeyInput">Optional API key (X-API-Key header)</label>
                 <input id="apiKeyInput" type="text" placeholder="Only needed if the server requires it." />
@@ -2443,7 +2637,6 @@ def show_submission_form():
             const validateBtn = document.getElementById('validateSubmitId');
             const submitBtn = document.getElementById('submitButton');
             const apiKeyInput = document.getElementById('apiKeyInput');
-            const consentBox = document.getElementById('submitConsent');
             const MIN_WORDS = parseInt(document.body.dataset.minWords || "50", 10) || 50;
             let validated = false;
 
@@ -2467,7 +2660,7 @@ def show_submission_form():
             function updateSubmitState(){
                 const count = updateWordCounter();
                 const hasText = textArea.value.trim().length > 0;
-                submitBtn.disabled = !(validated && hasText && count >= MIN_WORDS && consentBox.checked);
+                submitBtn.disabled = !(validated && hasText && count >= MIN_WORDS);
             }
 
             function lockForm(){
@@ -2526,8 +2719,6 @@ def show_submission_form():
             validateBtn.addEventListener('click', validateId);
 
             textArea.addEventListener('input', updateSubmitState);
-            consentBox.addEventListener('change', updateSubmitState);
-
             form.addEventListener('submit', async (event) => {
                 if (!validated) {
                     event.preventDefault();
